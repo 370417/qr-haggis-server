@@ -65,12 +65,12 @@ async fn main() {
 
     println!("Running on port {}", port());
 
-    warp::serve(route).run(([127, 0, 0, 1], port())).await;
+    warp::serve(route).run(([0, 0, 0, 0], port())).await;
 }
 
-/// Get the port from the $PORT environment variable or use 8080 as the default
+/// Get the port from the PORT environment variable or use 8080 as the default
 fn port() -> u16 {
-    match env::var("$PORT").map(|str| u16::from_str_radix(&str, 10)) {
+    match env::var("PORT").map(|str| u16::from_str_radix(&str, 10)) {
         Ok(Ok(port)) => port,
         _ => 8080,
     }
