@@ -4,13 +4,15 @@
 //! codes).
 
 use futures::{stream::SplitSink, stream::SplitStream, SinkExt, StreamExt};
-use std::env;
 use std::sync::Arc;
 use std::{collections::HashMap, convert::TryInto};
+use std::{convert::Infallible, env};
 use tokio::sync::Mutex;
 use warp::{
+    filters::ws::MissingConnectionUpgrade,
+    hyper::StatusCode,
     ws::{Message, WebSocket},
-    Filter,
+    Filter, Rejection, Reply,
 };
 
 /// The id of a client corresponds to an initial game state, represented as
@@ -58,7 +60,8 @@ async fn main() {
         .map(move |ws: warp::ws::Ws| {
             let clients = clients.clone();
             ws.on_upgrade(move |websocket| ws_handler(websocket, clients))
-        });
+        })
+        .recover(handle_rejection);
 
     println!("Running on port {}", port());
 
@@ -67,7 +70,7 @@ async fn main() {
 
 /// Get the port from the $PORT environment variable or use 8080 as the default
 fn port() -> u16 {
-    match env::var("PORT").map(|str| u16::from_str_radix(&str, 10)) {
+    match env::var("$PORT").map(|str| u16::from_str_radix(&str, 10)) {
         Ok(Ok(port)) => port,
         _ => 8080,
     }
@@ -83,6 +86,25 @@ async fn ws_handler(mut websocket: WebSocket, mut clients: Clients) {
     clients.add(client_id, sink).await;
     relay_messages(stream, client_id.swap(), &clients).await;
     clients.remove_and_close(&client_id).await;
+}
+
+/// Reply with 404 or 500 on error
+async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
+    let (status, message) = if err.is_not_found() {
+        (StatusCode::NOT_FOUND, "Not found".to_owned())
+    } else if let Some(_) = err.find::<MissingConnectionUpgrade>() {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing websocket upgrade header".to_owned(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Internal server error: {:?}", err),
+        )
+    };
+
+    Ok(warp::reply::with_status(message, status))
 }
 
 /// Read messages from the websocket until we find a message that can be a
