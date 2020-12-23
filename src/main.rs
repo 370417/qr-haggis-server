@@ -34,19 +34,20 @@ struct Clients(Arc<Mutex<HashMap<ClientId, Client>>>);
 type Client = SplitSink<WebSocket, Message>;
 
 impl Clients {
-    /// Add a client's sink, overriding any previous client with the same id.
+    /// Add a client's sink, overriding any previous client with the same id and
+    /// closing their connection.
     /// This means the server does not support multiple clients connecting to
     /// the same game as the same player.
     async fn add(&mut self, client_id: ClientId, client_sink: SplitSink<WebSocket, Message>) {
-        self.0.lock().await.insert(client_id, client_sink);
+        if let Some(mut old_client) = self.0.lock().await.insert(client_id, client_sink) {
+            old_client.close().await.unwrap_or_else(print_err);
+        }
     }
 
     /// Remove a client and try to close the connection gracefully.
     async fn remove_and_close(&mut self, client_id: &ClientId) {
         if let Some(mut sink) = self.0.lock().await.remove(client_id) {
-            if let Err(error) = sink.close().await {
-                eprintln!("error closing ws: {}", error);
-            }
+            sink.close().await.unwrap_or_else(print_err);
         }
     }
 }
@@ -88,27 +89,23 @@ async fn ws_handler(mut websocket: WebSocket, mut clients: Clients) {
     clients.remove_and_close(&client_id).await;
 }
 
-/// Reply with 404 or 500 on error
+/// Reply with 404, 400, or 500 on error
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     let (status, message) = if err.is_not_found() {
-        (StatusCode::NOT_FOUND, "Not found".to_owned())
+        (StatusCode::NOT_FOUND, "Not found")
     } else if let Some(_) = err.find::<MissingConnectionUpgrade>() {
-        (
-            StatusCode::BAD_REQUEST,
-            "Missing websocket upgrade header".to_owned(),
-        )
+        (StatusCode::BAD_REQUEST, "Missing websocket upgrade header")
     } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal server error: {:?}", err),
-        )
+        eprintln!("Internal server error: {:?}", err);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     };
 
-    Ok(warp::reply::with_status(message, status))
+    Ok(warp::reply::with_status::<&str>(message, status))
 }
 
 /// Read messages from the websocket until we find a message that can be a
-/// ClientId or the socket closes/errors.
+/// ClientId or the socket closes/errors. This function always tries to close
+/// the websocket if it errors.
 ///
 /// Looping instead of just looking at the first message accounts for pings.
 async fn read_client_id(websocket: &mut WebSocket) -> Option<ClientId> {
@@ -117,29 +114,27 @@ async fn read_client_id(websocket: &mut WebSocket) -> Option<ClientId> {
             Some(Ok(message)) => message,
             Some(Err(error)) => {
                 eprintln!("error receiving ws message: {}", error);
-                break None;
+                break;
             }
-            _ => break None,
+            _ => break,
         };
 
         if message.is_close() {
-            if let Err(error) = websocket.close().await {
-                eprintln!("error closing ws: {}", error);
-            }
-            break None;
-        }
-
-        if message.is_binary() {
+            break;
+        } else if message.is_binary() {
             let bytes = message.as_bytes();
             if bytes.len() < 8 {
                 continue;
             }
-            break Some(ClientId(
+            return Some(ClientId(
                 bytes[0..4].try_into().unwrap(),
                 bytes[4..8].try_into().unwrap(),
             ));
         }
     }
+
+    websocket.close().await.unwrap_or_else(print_err);
+    None
 }
 
 /// While the websocket remains open, send all messages received to the
@@ -171,9 +166,12 @@ async fn relay_message(opponent_id: ClientId, message: &[u8], clients: &Clients)
         None => return,
     };
 
-    let result = opponent.send(Message::binary(message)).await;
+    opponent
+        .send(Message::binary(message))
+        .await
+        .unwrap_or_else(print_err);
+}
 
-    if let Err(error) = result {
-        eprintln!("error sending ws message: {}", error);
-    }
+fn print_err(error: warp::Error) {
+    eprintln!("{}", error);
 }
